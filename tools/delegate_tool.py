@@ -1207,6 +1207,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_reasoning_effort: Optional[str] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1434,27 +1435,34 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: per-call override > delegation config > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
-    try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
-        if delegation_effort or delegation_effort is False:
-            from hermes_constants import parse_reasoning_effort
+    if override_reasoning_effort is not None:
+        from hermes_constants import parse_reasoning_effort
 
-            parsed = parse_reasoning_effort(delegation_effort)
-            if parsed is not None:
-                child_reasoning = parsed
-            else:
-                logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
-                    delegation_effort,
-                )
-    except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+        parsed = parse_reasoning_effort(override_reasoning_effort)
+        if parsed is not None:
+            child_reasoning = parsed
+    else:
+        try:
+            # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
+            # False (``reasoning_effort: false``) to "" and inherit the parent
+            # instead of disabling thinking for children.
+            delegation_effort = delegation_cfg.get("reasoning_effort")
+            if delegation_effort or delegation_effort is False:
+                from hermes_constants import parse_reasoning_effort
+
+                parsed = parse_reasoning_effort(delegation_effort)
+                if parsed is not None:
+                    child_reasoning = parsed
+                else:
+                    logger.warning(
+                        "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                        delegation_effort,
+                    )
+        except Exception as exc:
+            logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -2783,6 +2791,14 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+    max_tokens: Optional[int] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    request_overrides: Optional[Dict[str, Any]] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2790,7 +2806,12 @@ def delegate_task(
 
     Supports two modes:
       - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Batch:  provide tasks array [{goal, context, role, ...}, ...]
+
+    Optional per-call overrides (all default to parent agent's values):
+      model, provider, reasoning_effort, max_iterations, max_tokens,
+      base_url, api_key, api_mode, request_overrides.
+    Per-task overrides in the tasks array beat top-level ones.
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2839,18 +2860,7 @@ def delegate_task(
     # Load config
     cfg = _load_config()
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
-    # Model-supplied max_iterations is ignored — the config value is authoritative
-    # so users get predictable budgets. The kwarg is retained for internal callers
-    # and tests; a model-emitted value here would only shrink the budget and
-    # surprise the user mid-run. Log and drop it if one slips through from a
-    # cached tool schema or a stale provider.
-    if max_iterations is not None and max_iterations != default_max_iter:
-        logger.debug(
-            "delegate_task: ignoring caller-supplied max_iterations=%s; "
-            "using delegation.max_iterations=%s from config",
-            max_iterations, default_max_iter,
-        )
-    effective_max_iter = default_max_iter
+    effective_max_iter = max_iterations if max_iterations is not None else default_max_iter
 
     # Resolve delegation credentials (provider:model pair).
     # When delegation.provider is configured, this resolves the full credential
@@ -2861,6 +2871,26 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # Per-call overrides — these beat config-level delegation.* settings.
+    # The parent agent's own values are the fallback (handled in
+    # _build_child_agent via `model or parent_agent.model` etc.).
+    if model:
+        creds["model"] = model
+    if provider:
+        creds["provider"] = provider
+    if base_url:
+        creds["base_url"] = base_url
+    if api_key:
+        creds["api_key"] = api_key
+    if api_mode:
+        creds["api_mode"] = api_mode
+    if max_tokens is not None:
+        creds["max_output_tokens"] = max_tokens
+    if request_overrides:
+        creds["request_overrides"] = dict(request_overrides)
+    if reasoning_effort:
+        creds["reasoning_effort"] = reasoning_effort
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2941,6 +2971,16 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        # Per-task overrides beat top-level overrides, which beat config.
+        task_model = t.get("model") or model
+        task_provider = t.get("provider") or provider
+        task_reasoning = t.get("reasoning_effort") or reasoning_effort
+        task_max_iter = t.get("max_iterations") or max_iterations
+        task_max_tokens = t.get("max_tokens") or max_tokens
+        task_base_url = t.get("base_url") or base_url
+        task_api_key = t.get("api_key") or api_key
+        task_api_mode = t.get("api_mode") or api_mode
+        task_req_overrides = t.get("request_overrides") or request_overrides
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -2948,16 +2988,17 @@ def delegate_task(
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
-            model=creds["model"],
-            max_iterations=effective_max_iter,
+            model=task_model or creds["model"],
+            max_iterations=task_max_iter or effective_max_iter,
             task_count=n_tasks,
             parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
+            override_provider=task_provider or creds["provider"],
+            override_base_url=task_base_url or creds["base_url"],
+            override_api_key=task_api_key or creds["api_key"],
+            override_api_mode=task_api_mode or creds["api_mode"],
+            override_request_overrides=task_req_overrides or creds.get("request_overrides"),
+            override_max_tokens=task_max_tokens or creds.get("max_output_tokens"),
+            override_reasoning_effort=task_reasoning or creds.get("reasoning_effort"),
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
@@ -3690,8 +3731,11 @@ def _build_top_level_description() -> str:
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "- Children inherit the parent model and provider unless a per-call "
+        "or per-task model/provider override is specified. All delegation "
+        "parameters (model, provider, reasoning_effort, max_iterations, "
+        "max_tokens, base_url, api_key, api_mode, request_overrides) are "
+        "optional and default to the parent agent's values or config defaults. "
         "Results are returned as an array, one entry per task."
     )
 
@@ -3819,6 +3863,42 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model": {
+                            "type": "string",
+                            "description": "Per-task model override (e.g. 'anthropic/claude-sonnet-4'). Defaults to parent agent's model.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "Per-task provider override (e.g. 'openrouter', 'anthropic'). Defaults to parent agent's provider.",
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "description": "Per-task reasoning effort ('none', 'minimal', 'low', 'medium', 'high', 'xhigh'). Defaults to parent's level.",
+                        },
+                        "max_iterations": {
+                            "type": "integer",
+                            "description": "Per-task iteration budget. Defaults to delegation.max_iterations from config.",
+                        },
+                        "max_tokens": {
+                            "type": "integer",
+                            "description": "Per-task max output tokens. Defaults to config or provider default.",
+                        },
+                        "base_url": {
+                            "type": "string",
+                            "description": "Per-task custom API base URL. Defaults to parent agent's endpoint.",
+                        },
+                        "api_key": {
+                            "type": "string",
+                            "description": "Per-task custom API key. Defaults to parent agent's credential.",
+                        },
+                        "api_mode": {
+                            "type": "string",
+                            "description": "Per-task API wire format ('chat_completions', 'codex_responses', 'anthropic_messages'). Auto-detected when omitted.",
+                        },
+                        "request_overrides": {
+                            "type": "object",
+                            "description": "Per-task provider-specific request parameters (e.g. {'temperature': 0.3}). Merged into the API request.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3843,6 +3923,42 @@ DELEGATE_TASK_SCHEMA = {
                     "Setting this has no effect; the parameter remains only for "
                     "backward compatibility."
                 ),
+            },
+            "model": {
+                "type": "string",
+                "description": "Model for ALL tasks in this call (e.g. 'anthropic/claude-sonnet-4'). Defaults to parent agent's model. Per-task 'model' overrides this.",
+            },
+            "provider": {
+                "type": "string",
+                "description": "Provider for ALL tasks in this call (e.g. 'openrouter', 'anthropic'). Defaults to parent agent's provider. Per-task 'provider' overrides this.",
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "description": "Reasoning effort for ALL tasks ('none', 'minimal', 'low', 'medium', 'high', 'xhigh'). Defaults to parent's level. Per-task 'reasoning_effort' overrides this.",
+            },
+            "max_iterations": {
+                "type": "integer",
+                "description": "Iteration budget for all tasks. Defaults to delegation.max_iterations from config. Per-task 'max_iterations' overrides this.",
+            },
+            "max_tokens": {
+                "type": "integer",
+                "description": "Max output tokens for all tasks. Defaults to config or provider default. Per-task 'max_tokens' overrides this.",
+            },
+            "base_url": {
+                "type": "string",
+                "description": "Custom API base URL for all tasks. Defaults to parent agent's endpoint. Per-task 'base_url' overrides this.",
+            },
+            "api_key": {
+                "type": "string",
+                "description": "Custom API key for all tasks. Defaults to parent agent's credential. Per-task 'api_key' overrides this.",
+            },
+            "api_mode": {
+                "type": "string",
+                "description": "API wire format for all tasks ('chat_completions', 'codex_responses', 'anthropic_messages'). Auto-detected when omitted. Per-task 'api_mode' overrides this.",
+            },
+            "request_overrides": {
+                "type": "object",
+                "description": "Provider-specific request parameters for all tasks (e.g. {'temperature': 0.3}). Merged into the API request. Per-task 'request_overrides' overrides this.",
             },
         },
         "required": [],
